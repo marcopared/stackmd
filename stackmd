@@ -1,0 +1,915 @@
+#!/usr/bin/env python3
+"""
+stackmd_portable: build a single-file markdown "codebase pack" for LLM review.
+
+Goals:
+- one portable markdown file
+- aggressively skip junk
+- include a directory tree, file index, and reading guide
+- use per-file modes: full, chunked, summary, skip
+- keep large repos within a practical size budget
+
+Examples:
+  ./stackmd_portable.py
+  ./stackmd_portable.py ../repo
+  ./stackmd_portable.py ../repo -o repo_pack.md
+  ./stackmd_portable.py ../repo --extensions .py,.ts,.tsx
+  ./stackmd_portable.py ../repo --docs-only
+  ./stackmd_portable.py ../repo --max-output-chars 1200000
+  ./stackmd_portable.py ../repo --include-hidden
+"""
+
+from __future__ import annotations
+
+import argparse
+import re
+import sys
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Dict, List, Optional, Sequence, Tuple
+
+SKIP_DIRS = frozenset({
+    ".git",
+    ".hg",
+    ".svn",
+    ".idea",
+    ".vscode",
+    ".DS_Store",
+    "node_modules",
+    "dist",
+    "build",
+    ".next",
+    ".nuxt",
+    ".output",
+    ".turbo",
+    ".cache",
+    "coverage",
+    "tmp",
+    "temp",
+    "vendor",
+    "target",
+    "out",
+    "__pycache__",
+    ".pytest_cache",
+    ".mypy_cache",
+    ".ruff_cache",
+    ".venv",
+    "venv",
+    ".gradle",
+    ".terraform",
+    ".serverless",
+    ".docusaurus",
+    ".yarn",
+    ".pnpm-store",
+})
+
+SKIP_EXACT_FILES = frozenset({
+    "package-lock.json",
+    "pnpm-lock.yaml",
+    "yarn.lock",
+    "bun.lockb",
+    "Cargo.lock",
+    ".env.local",
+    ".env.development.local",
+    ".env.test.local",
+    ".env.production.local",
+})
+
+SKIP_SUFFIXES = frozenset({
+    ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".ico", ".svg", ".pdf",
+    ".zip", ".gz", ".tar", ".tgz", ".7z", ".rar",
+    ".mp3", ".wav", ".m4a", ".mp4", ".mov", ".avi", ".mkv",
+    ".woff", ".woff2", ".ttf", ".otf", ".eot",
+    ".jar", ".class", ".dll", ".so", ".dylib", ".exe",
+    ".pyc", ".pyo", ".a", ".o", ".bin", ".dat", ".db", ".sqlite", ".sqlite3",
+    ".lock",
+})
+
+DOC_ONLY_EXTENSIONS = frozenset({".md", ".txt"})
+
+LANGUAGE_MAP = {
+    ".ts": "ts",
+    ".tsx": "tsx",
+    ".js": "js",
+    ".jsx": "jsx",
+    ".mjs": "js",
+    ".cjs": "js",
+    ".json": "json",
+    ".py": "python",
+    ".go": "go",
+    ".java": "java",
+    ".c": "c",
+    ".cpp": "cpp",
+    ".cc": "cpp",
+    ".h": "c",
+    ".hpp": "cpp",
+    ".rs": "rust",
+    ".md": "markdown",
+    ".txt": "text",
+    ".mdx": "mdx",
+    ".html": "html",
+    ".css": "css",
+    ".scss": "scss",
+    ".sass": "sass",
+    ".yml": "yaml",
+    ".yaml": "yaml",
+    ".sh": "bash",
+    ".bash": "bash",
+    ".zsh": "bash",
+    ".sql": "sql",
+    ".xml": "xml",
+    ".toml": "toml",
+    ".ini": "ini",
+    ".cfg": "ini",
+    ".env": "bash",
+    ".graphql": "graphql",
+    ".proto": "proto",
+}
+
+PRINTABLE_TEXT_RE = re.compile(rb"[\x09\x0A\x0D\x20-\x7E]")
+BINARY_CHECK_CHUNK_SIZE = 8192
+MAX_TREE_LINES = 400
+MAX_SUMMARY_BULLETS = 8
+MAX_SUMMARY_LINE_LEN = 120
+
+
+@dataclass
+class Chunk:
+    title: str
+    start_line: int
+    end_line: int
+    content: str
+
+
+@dataclass
+class FileRecord:
+    relative_path: str
+    language: str
+    role: str
+    mode: str
+    line_count: int
+    char_count: int
+    priority: int
+    content: Optional[str] = None
+    chunks: List[Chunk] = field(default_factory=list)
+    summary_points: List[str] = field(default_factory=list)
+    skip_reason: Optional[str] = None
+
+
+def get_language(path: Path) -> str:
+    return LANGUAGE_MAP.get(path.suffix.lower(), path.suffix.lower().lstrip(".") or "text")
+
+
+def should_skip_dir(name: str, include_hidden: bool) -> bool:
+    if name in SKIP_DIRS:
+        return True
+    if not include_hidden and name.startswith("."):
+        return True
+    return False
+
+
+def is_binary(file_path: Path) -> bool:
+    """
+    Heuristic binary detector.
+
+    Rules:
+    - known text extensions are never treated as binary
+    - files containing NUL bytes are binary
+    - otherwise inspect a sample and classify as binary only if the
+      non-text byte ratio is meaningfully high
+    """
+    text_suffixes = {
+        ".md", ".mdx", ".txt", ".rst",
+        ".py", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs",
+        ".json", ".yaml", ".yml", ".toml", ".ini", ".cfg",
+        ".sh", ".bash", ".zsh",
+        ".css", ".scss", ".sass", ".html", ".xml",
+        ".sql", ".graphql", ".proto",
+        ".go", ".java", ".c", ".cc", ".cpp", ".h", ".hpp", ".rs",
+        ".env",
+    }
+
+    if file_path.suffix.lower() in text_suffixes:
+        return False
+
+    try:
+        with open(file_path, "rb") as f:
+            chunk = f.read(BINARY_CHECK_CHUNK_SIZE)
+    except OSError:
+        return True
+
+    if not chunk:
+        return False
+
+    if b"\x00" in chunk:
+        return True
+
+    text_byte_set = set(range(32, 127)) | {9, 10, 13, 8, 12}
+    nontext = sum(byte not in text_byte_set for byte in chunk)
+    ratio = nontext / len(chunk)
+
+    return ratio > 0.30
+
+
+def normalize_extensions(raw: Optional[str]) -> Optional[frozenset[str]]:
+    if not raw:
+        return None
+
+    values = []
+    for item in raw.split(","):
+        item = item.strip().lower()
+        if not item:
+            continue
+        values.append(item if item.startswith(".") else f".{item}")
+    return frozenset(values) if values else None
+
+
+def has_valid_extension(path: Path, extensions: Optional[frozenset[str]]) -> bool:
+    return extensions is None or path.suffix.lower() in extensions
+
+
+def should_skip_file(
+    path: Path,
+    include_hidden: bool,
+    extensions: Optional[frozenset[str]],
+) -> Optional[str]:
+    name = path.name
+    suffix = path.suffix.lower()
+
+    if not include_hidden and name.startswith("."):
+        return "hidden"
+    if name in SKIP_EXACT_FILES:
+        return "lockfile/local env"
+    if suffix in SKIP_SUFFIXES:
+        return "binary or low-signal asset"
+    if not has_valid_extension(path, extensions):
+        return "extension filtered out"
+    if is_binary(path):
+        return "binary"
+    return None
+
+
+def collect_files(
+    root_dir: Path,
+    include_hidden: bool,
+    extensions: Optional[frozenset[str]],
+) -> Tuple[List[Path], List[Tuple[str, str]]]:
+    included: List[Path] = []
+    skipped: List[Tuple[str, str]] = []
+
+    def walk(current: Path) -> None:
+        try:
+            entries = sorted(current.iterdir(), key=lambda p: p.name.lower())
+        except OSError as exc:
+            print(f"Warning: cannot read directory {current}: {exc}", file=sys.stderr)
+            return
+
+        for entry in entries:
+            try:
+                is_dir = entry.is_dir()
+            except OSError:
+                continue
+
+            rel = str(entry.relative_to(root_dir)).replace("\\", "/")
+            if is_dir:
+                if should_skip_dir(entry.name, include_hidden):
+                    skipped.append((rel + "/", "skipped directory"))
+                    continue
+                walk(entry)
+                continue
+
+            reason = should_skip_file(entry, include_hidden, extensions)
+            if reason:
+                skipped.append((rel, reason))
+                continue
+
+            included.append(entry)
+
+    walk(root_dir)
+    included.sort(key=lambda p: str(p).replace("\\", "/"))
+    skipped.sort(key=lambda x: x[0])
+    return included, skipped
+
+
+def read_file_content(path: Path) -> Optional[str]:
+    try:
+        return path.read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        print(f"Warning: cannot read file {path}: {exc}", file=sys.stderr)
+        return None
+
+
+def summarize_role(path: Path) -> str:
+    name = path.name.lower()
+    parts = [p.lower() for p in path.parts]
+    suffix = path.suffix.lower()
+
+    if name in {"readme", "readme.md", "readme.mdx", "readme.txt"}:
+        return "project overview and setup"
+    if name in {"package.json", "pyproject.toml", "cargo.toml", "go.mod", "pom.xml"}:
+        return "dependency and build configuration"
+    if name in {"tsconfig.json", "turbo.json", "vite.config.ts", "next.config.js", "next.config.ts"}:
+        return "build/runtime configuration"
+    if name.startswith("dockerfile") or name in {"docker-compose.yml", "docker-compose.yaml"}:
+        return "container/runtime configuration"
+    if name.startswith(".env"):
+        return "environment configuration"
+    if suffix in {".md", ".mdx", ".txt"}:
+        return "documentation"
+    if suffix in {".json", ".yaml", ".yml", ".toml", ".ini", ".cfg"}:
+        return "configuration"
+    if (
+        "test" in parts
+        or "tests" in parts
+        or name.endswith((".test.ts", ".spec.ts", ".test.js", ".spec.js", ".test.py", ".spec.py"))
+    ):
+        return "tests"
+    if any(part in {"prisma", "migrations", "schema"} for part in parts) or name == "schema.prisma":
+        return "database schema or migration"
+    if any(part in {"api", "routes", "route", "controllers"} for part in parts):
+        return "API surface or routing"
+    if any(part in {"types", "interfaces", "models", "schemas"} for part in parts):
+        return "shared types or schemas"
+    if name.startswith(("index.", "main.", "app.")):
+        return "entrypoint"
+    return "source code"
+
+
+def priority_score(path: Path, role: str) -> int:
+    rp = str(path).replace("\\", "/").lower()
+    name = path.name.lower()
+    score = 0
+
+    if name in {
+        "readme.md",
+        "readme.mdx",
+        "readme.txt",
+        "package.json",
+        "pyproject.toml",
+        "go.mod",
+        "cargo.toml",
+        "dockerfile",
+        "schema.prisma",
+    }:
+        score += 100
+    if role in {
+        "project overview and setup",
+        "dependency and build configuration",
+        "entrypoint",
+        "database schema or migration",
+        "API surface or routing",
+    }:
+        score += 60
+    if any(token in rp for token in ["src/main", "src/index", "/app/", "/pages/", "/routes/", "/api/", "/services/", "/core/", "/lib/"]):
+        score += 35
+    if role == "tests":
+        score -= 20
+    if "/generated/" in rp or "/gen/" in rp:
+        score -= 60
+    return score
+
+
+def first_nonempty_lines(content: str, limit: int = 12) -> List[str]:
+    out: List[str] = []
+    for raw in content.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        out.append(line[:MAX_SUMMARY_LINE_LEN])
+        if len(out) >= limit:
+            break
+    return out
+
+
+def extract_summary_points(path: Path, content: str, role: str) -> List[str]:
+    suffix = path.suffix.lower()
+    points: List[str] = []
+
+    if suffix in {".md", ".mdx"}:
+        for line in content.splitlines():
+            match = re.match(r"^(#{1,3})\s+(.*)$", line.strip())
+            if match:
+                points.append(f"heading: {match.group(2).strip()[:MAX_SUMMARY_LINE_LEN]}")
+            if len(points) >= MAX_SUMMARY_BULLETS:
+                break
+    elif suffix in {".ts", ".tsx", ".js", ".jsx", ".py", ".go", ".java", ".rs"}:
+        patterns = [
+            r"^(?:export\s+)?(?:async\s+)?function\s+([A-Za-z_][A-Za-z0-9_]*)",
+            r"^(?:export\s+)?class\s+([A-Za-z_][A-Za-z0-9_]*)",
+            r"^(?:export\s+)?(?:const|let|var)\s+([A-Za-z_][A-Za-z0-9_]*)\s*=",
+            r"^def\s+([A-Za-z_][A-Za-z0-9_]*)",
+            r"^class\s+([A-Za-z_][A-Za-z0-9_]*)",
+        ]
+        combined = re.compile("|".join(patterns), re.MULTILINE)
+        for match in combined.finditer(content):
+            symbol = next((group for group in match.groups() if group), None)
+            if symbol:
+                points.append(f"symbol: {symbol}")
+            if len(points) >= MAX_SUMMARY_BULLETS:
+                break
+    elif suffix in {".json", ".yaml", ".yml", ".toml", ".ini", ".cfg"}:
+        for line in first_nonempty_lines(content, limit=20):
+            if line.startswith(("{", "}", "[", "]")):
+                continue
+            points.append(f"config: {line}")
+            if len(points) >= MAX_SUMMARY_BULLETS:
+                break
+
+    if not points:
+        for line in first_nonempty_lines(content, limit=MAX_SUMMARY_BULLETS):
+            points.append(f"excerpt: {line}")
+
+    if role:
+        points.insert(0, f"role: {role}")
+
+    return points[:MAX_SUMMARY_BULLETS]
+
+
+def line_number_index(content: str) -> List[int]:
+    offsets = [0]
+    for line in content.splitlines(keepends=True):
+        offsets.append(offsets[-1] + len(line))
+    return offsets
+
+
+def offset_to_line(offsets: Sequence[int], char_offset: int) -> int:
+    lo, hi = 0, len(offsets) - 1
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        if offsets[mid] <= char_offset:
+            lo = mid + 1
+        else:
+            hi = mid - 1
+    return max(1, hi + 1)
+
+
+def chunk_markdown(content: str) -> List[Chunk]:
+    lines = content.splitlines()
+    chunks: List[Chunk] = []
+    current_title = "Document start"
+    current_lines: List[str] = []
+    current_start = 1
+
+    def flush(end_line: int) -> None:
+        nonlocal current_title, current_lines, current_start
+        text = "\n".join(current_lines).strip("\n")
+        if text:
+            chunks.append(Chunk(current_title, current_start, end_line, text))
+
+    for idx, line in enumerate(lines, start=1):
+        if re.match(r"^#{1,3}\s+", line):
+            flush(idx - 1)
+            current_title = re.sub(r"^#{1,3}\s+", "", line).strip() or "Untitled section"
+            current_lines = [line]
+            current_start = idx
+        else:
+            current_lines.append(line)
+
+    flush(len(lines))
+    return chunks or [Chunk("Full file", 1, len(lines), content)]
+
+
+def chunk_code(content: str) -> List[Chunk]:
+    patterns = [
+        r"^(?:export\s+)?(?:async\s+)?function\s+([A-Za-z_][A-Za-z0-9_]*)",
+        r"^(?:export\s+)?class\s+([A-Za-z_][A-Za-z0-9_]*)",
+        r"^(?:export\s+)?(?:const|let|var)\s+([A-Za-z_][A-Za-z0-9_]*)\s*=",
+        r"^def\s+([A-Za-z_][A-Za-z0-9_]*)",
+        r"^class\s+([A-Za-z_][A-Za-z0-9_]*)",
+    ]
+    regex = re.compile("|".join(patterns), re.MULTILINE)
+    matches = list(regex.finditer(content))
+    lines = content.splitlines()
+
+    if not matches:
+        return [Chunk("Full file", 1, len(lines), content)]
+
+    offsets = line_number_index(content)
+    chunks: List[Chunk] = []
+    starts = [match.start() for match in matches]
+    bounds = starts + [len(content)]
+
+    prelude_end_line = offset_to_line(offsets, starts[0]) - 1
+    if prelude_end_line >= 1:
+        prelude = "\n".join(lines[:prelude_end_line]).strip("\n")
+        if prelude:
+            chunks.append(Chunk("Prelude / imports", 1, prelude_end_line, prelude))
+
+    for idx, match in enumerate(matches):
+        start = bounds[idx]
+        end = bounds[idx + 1]
+        symbol = next((group for group in match.groups() if group), f"section_{idx + 1}")
+        start_line = offset_to_line(offsets, start)
+        end_line = max(start_line, offset_to_line(offsets, end) - 1)
+        text = content[start:end].strip("\n")
+        if text:
+            chunks.append(Chunk(f"Symbol `{symbol}`", start_line, end_line, text))
+
+    return chunks or [Chunk("Full file", 1, len(lines), content)]
+
+
+def choose_mode(
+    path: Path,
+    role: str,
+    content: str,
+    priority: int,
+    full_cutoff: int,
+    chunk_cutoff: int,
+) -> str:
+    char_count = len(content)
+    line_count = len(content.splitlines())
+    rp = str(path).replace("\\", "/").lower()
+
+    if "/generated/" in rp or "/gen/" in rp or rp.endswith(".min.js"):
+        return "summary"
+    if priority >= 100:
+        return "full" if char_count <= max(full_cutoff * 2, 50000) else "chunked"
+    if role in {
+        "project overview and setup",
+        "dependency and build configuration",
+        "entrypoint",
+        "database schema or migration",
+        "API surface or routing",
+    }:
+        return "full" if char_count <= max(full_cutoff, 25000) else "chunked"
+    if role == "documentation":
+        return "full" if char_count <= full_cutoff else "chunked"
+    if role == "tests":
+        return "summary" if char_count > 4000 or line_count > 150 else "full"
+    if char_count <= full_cutoff and line_count <= 250:
+        return "full"
+    if char_count <= chunk_cutoff and line_count <= 1200:
+        return "chunked"
+    return "summary"
+
+
+def build_directory_tree(records: Sequence[FileRecord]) -> List[str]:
+    children: Dict[str, set[str]] = {}
+
+    for record in records:
+        parts = record.relative_path.split("/")
+        prefix = ""
+        for idx, part in enumerate(parts):
+            key = prefix
+            children.setdefault(key, set()).add(part)
+            prefix = f"{prefix}/{part}" if prefix else part
+            if idx < len(parts) - 1:
+                children.setdefault(prefix, set())
+
+    lines: List[str] = []
+
+    def walk(prefix: str, depth: int) -> None:
+        if len(lines) >= MAX_TREE_LINES:
+            return
+
+        names = sorted(children.get(prefix, set()), key=str.lower)
+        for name in names:
+            path = f"{prefix}/{name}" if prefix else name
+            is_dir = path in children and bool(children[path])
+            lines.append(f"{'  ' * depth}- {name}{'/' if is_dir else ''}")
+            if is_dir:
+                walk(path, depth + 1)
+                if len(lines) >= MAX_TREE_LINES:
+                    return
+
+    walk("", 0)
+
+    if len(lines) >= MAX_TREE_LINES:
+        lines.append("- ... tree truncated ...")
+
+    return lines
+
+
+def format_code_fence(content: str, language: str) -> List[str]:
+    return [f"```{language}", content, "```"]
+
+
+def cap_chunk_content(text: str, max_chars: int) -> str:
+    if len(text) <= max_chars:
+        return text
+    return text[:max_chars].rstrip() + "\n... [chunk truncated]"
+
+
+def record_to_section(record: FileRecord, chunk_char_limit: int) -> List[str]:
+    lines = [
+        f"## FILE: {record.relative_path}",
+        f"- Role: {record.role}",
+        f"- Mode: {record.mode}",
+        f"- Language: {record.language}",
+        f"- Lines: {record.line_count}",
+        f"- Characters: {record.char_count}",
+        "",
+    ]
+
+    if record.mode == "summary":
+        lines.append("### Summary")
+        for point in record.summary_points:
+            lines.append(f"- {point}")
+        lines.append("")
+        return lines
+
+    if record.mode == "full":
+        lines.append("### Full Content")
+        lines.extend(format_code_fence(record.content or "", record.language))
+        lines.append("")
+        return lines
+
+    lines.append("### Section Index")
+    for chunk in record.chunks:
+        lines.append(f"- {chunk.title} ({chunk.start_line}-{chunk.end_line})")
+    lines.append("")
+
+    for chunk in record.chunks:
+        lines.append(f"### {chunk.title}")
+        lines.append(f"Lines {chunk.start_line}-{chunk.end_line}")
+        lines.extend(format_code_fence(cap_chunk_content(chunk.content, chunk_char_limit), record.language))
+        lines.append("")
+
+    return lines
+
+
+def build_markdown(
+    root_name: str,
+    records: Sequence[FileRecord],
+    skipped: Sequence[Tuple[str, str]],
+    max_output_chars: int,
+    chunk_char_limit: int,
+) -> str:
+    total_lines = sum(record.line_count for record in records)
+    mode_counts: Dict[str, int] = {"full": 0, "chunked": 0, "summary": 0}
+
+    for record in records:
+        mode_counts[record.mode] = mode_counts.get(record.mode, 0) + 1
+
+    tree_lines = build_directory_tree(records)
+    reading_guide = sorted(records, key=lambda record: (-record.priority, record.relative_path))[:12]
+
+    out: List[str] = [
+        f"# CODEBASE PACK: {root_name}",
+        "",
+        "## MANIFEST",
+        f"- Included files: {len(records)}",
+        f"- Skipped files/directories: {len(skipped)}",
+        f"- Total included lines: {total_lines}",
+        f"- Full files: {mode_counts.get('full', 0)}",
+        f"- Chunked files: {mode_counts.get('chunked', 0)}",
+        f"- Summary files: {mode_counts.get('summary', 0)}",
+        "",
+        "## READING GUIDE",
+        "Start with these files first:",
+    ]
+
+    for idx, record in enumerate(reading_guide, start=1):
+        out.append(f"{idx}. `{record.relative_path}` — {record.role} [{record.mode}]")
+
+    out.extend([
+        "",
+        "## DIRECTORY TREE",
+        *tree_lines,
+        "",
+        "## FILE INDEX",
+        "| Path | Role | Lines | Chars | Mode |",
+        "|---|---|---:|---:|---|",
+    ])
+
+    for record in records:
+        out.append(
+            f"| `{record.relative_path}` | {record.role} | {record.line_count} | {record.char_count} | {record.mode} |"
+        )
+
+    if skipped:
+        out.extend(["", "## SKIPPED ITEMS"])
+        preview = list(skipped[:120])
+        for rel, reason in preview:
+            out.append(f"- `{rel}` — {reason}")
+        if len(skipped) > len(preview):
+            out.append(f"- ... plus {len(skipped) - len(preview)} more skipped items")
+
+    out.extend(["", "## FILE CONTENT", ""])
+
+    current_chars = len("\n".join(out))
+    truncated_sections = 0
+
+    for idx, record in enumerate(records):
+        section_lines = record_to_section(record, chunk_char_limit)
+        section_text = "\n".join(section_lines)
+
+        if current_chars + len(section_text) + 2 > max_output_chars:
+            truncated_sections += 1
+            if record.mode == "full":
+                fallback = FileRecord(
+                    relative_path=record.relative_path,
+                    language=record.language,
+                    role=record.role,
+                    mode="summary",
+                    line_count=record.line_count,
+                    char_count=record.char_count,
+                    priority=record.priority,
+                    summary_points=record.summary_points or extract_summary_points(
+                        Path(record.relative_path),
+                        record.content or "",
+                        record.role,
+                    ),
+                )
+                section_lines = record_to_section(fallback, chunk_char_limit)
+                section_text = "\n".join(section_lines)
+            elif record.mode == "chunked":
+                slim = FileRecord(
+                    relative_path=record.relative_path,
+                    language=record.language,
+                    role=record.role,
+                    mode="summary",
+                    line_count=record.line_count,
+                    char_count=record.char_count,
+                    priority=record.priority,
+                    summary_points=record.summary_points,
+                )
+                section_lines = record_to_section(slim, chunk_char_limit)
+                section_text = "\n".join(section_lines)
+
+        if current_chars + len(section_text) + 2 > max_output_chars:
+            out.extend([
+                "## OUTPUT TRUNCATION NOTICE",
+                f"The output hit the max budget of {max_output_chars} characters.",
+                f"Additional omitted file sections: {len(records) - idx}",
+            ])
+            break
+
+        out.extend(section_lines)
+        current_chars += len(section_text) + 2
+
+    if truncated_sections:
+        out.extend([
+            "## BUDGET NOTES",
+            f"{truncated_sections} file section(s) were automatically downgraded to summaries to stay within the output budget.",
+            "",
+        ])
+
+    out.extend([
+        "## HOW TO USE THIS PACK WITH AN LLM",
+        "Ask the LLM to start from the manifest, reading guide, and file index, then inspect only the relevant files or chunk sections.",
+        "",
+    ])
+
+    return "\n".join(out)
+
+
+def build_records(
+    root: Path,
+    files: Sequence[Path],
+    full_cutoff: int,
+    chunk_cutoff: int,
+) -> List[FileRecord]:
+    records: List[FileRecord] = []
+
+    for file_path in files:
+        content = read_file_content(file_path)
+        if content is None:
+            continue
+
+        relative = str(file_path.relative_to(root)).replace("\\", "/")
+        language = get_language(file_path)
+        role = summarize_role(file_path)
+        priority = priority_score(file_path, role)
+        mode = choose_mode(file_path, role, content, priority, full_cutoff, chunk_cutoff)
+        summary_points = extract_summary_points(file_path, content, role)
+        line_count = len(content.splitlines())
+        char_count = len(content)
+        chunks: List[Chunk] = []
+
+        if mode == "chunked":
+            if file_path.suffix.lower() in {".md", ".mdx", ".txt"}:
+                chunks = chunk_markdown(content)
+            else:
+                chunks = chunk_code(content)
+
+        records.append(
+            FileRecord(
+                relative_path=relative,
+                language=language,
+                role=role,
+                mode=mode,
+                line_count=line_count,
+                char_count=char_count,
+                priority=priority,
+                content=content if mode == "full" else None,
+                chunks=chunks,
+                summary_points=summary_points,
+            )
+        )
+
+    records.sort(key=lambda record: (-record.priority, record.relative_path))
+    return records
+
+
+def build_default_output_name(root: Path, docs_only: bool) -> str:
+    folder = root.name.upper()
+    suffix = "DOCS" if docs_only else "CODEBASE"
+    return f"STACKMD-{folder}-{suffix}.md"
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Create a single-file markdown codebase pack for LLM review."
+    )
+    parser.add_argument(
+        "directory",
+        nargs="?",
+        default=".",
+        help="Directory to scan (default: current directory)",
+    )
+    parser.add_argument(
+        "-o",
+        "--output",
+        default=None,
+        help="Output path (default: STACKMD-<FOLDER>-CODEBASE.md or STACKMD-<FOLDER>-DOCS.md inside the scanned repo)",
+    )
+    parser.add_argument(
+        "--include-hidden",
+        action="store_true",
+        help="Include hidden files and directories",
+    )
+    parser.add_argument(
+        "--extensions",
+        metavar="LIST",
+        help="Comma-separated extensions to include, e.g. .py,.ts,.tsx,.md",
+    )
+    parser.add_argument(
+        "--docs-only",
+        action="store_true",
+        help="Only include documentation files (.md and .txt)",
+    )
+    parser.add_argument(
+        "--max-output-chars",
+        type=int,
+        default=1_500_000,
+        help="Max characters for the final markdown output",
+    )
+    parser.add_argument(
+        "--full-cutoff",
+        type=int,
+        default=12_000,
+        help="Max chars for a file to usually be included in full",
+    )
+    parser.add_argument(
+        "--chunk-cutoff",
+        type=int,
+        default=80_000,
+        help="Max chars for a file to usually be chunked instead of summarized",
+    )
+    parser.add_argument(
+        "--chunk-char-limit",
+        type=int,
+        default=18_000,
+        help="Max chars per emitted chunk in chunked mode",
+    )
+    return parser.parse_args()
+
+
+def main() -> int:
+    args = parse_args()
+    root = Path(args.directory).expanduser().resolve()
+
+    if not root.exists():
+        print(f"Error: directory does not exist: {root}", file=sys.stderr)
+        return 1
+    if not root.is_dir():
+        print(f"Error: path is not a directory: {root}", file=sys.stderr)
+        return 1
+
+    if args.docs_only:
+        extensions = DOC_ONLY_EXTENSIONS
+    else:
+        extensions = normalize_extensions(args.extensions)
+
+    files, skipped = collect_files(root, args.include_hidden, extensions)
+    records = build_records(root, files, args.full_cutoff, args.chunk_cutoff)
+
+    markdown = build_markdown(
+        root_name=root.name,
+        records=records,
+        skipped=skipped,
+        max_output_chars=args.max_output_chars,
+        chunk_char_limit=args.chunk_char_limit,
+    )
+
+    if args.output:
+        output_path = Path(args.output).expanduser()
+        if not output_path.is_absolute():
+            output_path = Path.cwd() / output_path
+    else:
+        output_path = root / build_default_output_name(root, args.docs_only)
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(markdown, encoding="utf-8")
+
+    total_lines = sum(record.line_count for record in records)
+    print(
+        f"Created {output_path} with {len(records)} included files, "
+        f"{len(skipped)} skipped items, and {total_lines} included lines"
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
