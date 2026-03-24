@@ -1,6 +1,6 @@
-# stackmd_portable
+# stackmd
 
-`stackmd_portable` builds a single markdown "pack" from a local repository so you can paste or upload it into ChatGPT, Claude, or other LLM chat interfaces that do **not** have direct access to your filesystem.
+`stackmd` builds a single markdown "pack" from a local repository so you can paste or upload it into ChatGPT, Claude, or other LLM chat interfaces that do **not** have direct access to your filesystem.
 
 It is designed for portability, not deep codebase-scale navigation.
 
