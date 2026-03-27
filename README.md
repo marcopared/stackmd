@@ -104,6 +104,3 @@ STACKMD*
 
 Upload output into ChatGPT / Claude when they cannot access your repo.
 
-## License
-
-Add license here.
