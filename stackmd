@@ -1,32 +1,32 @@
 #!/usr/bin/env python3
 """
-stackmd_portable: build a single-file markdown "codebase pack" for LLM review.
+stackmd_plus: build a single-file markdown "codebase pack" for LLM review,
+with selected ai-digest-style features layered on top.
 
-Goals:
-- one portable markdown file
-- aggressively skip junk
-- include a directory tree, file index, and reading guide
-- use per-file modes: full, chunked, summary, skip
-- keep large repos within a practical size budget
+Preserved defaults from stackmd_portable:
+- default output stays STACKMD-<FOLDER>-CODEBASE.md or STACKMD-<FOLDER>-DOCS.md
+- positional directory still works
+- manifest / reading guide / directory tree / file index remain central
 
-Examples:
-  ./stackmd_portable.py
-  ./stackmd_portable.py ../repo
-  ./stackmd_portable.py ../repo -o repo_pack.md
-  ./stackmd_portable.py ../repo --extensions .py,.ts,.tsx
-  ./stackmd_portable.py ../repo --docs-only
-  ./stackmd_portable.py ../repo --max-output-chars 1200000
-  ./stackmd_portable.py ../repo --include-hidden
+Added features inspired by ai-digest:
+- custom ignore patterns via .aidigestignore (configurable)
+- custom minify patterns via .aidigestminify (configurable)
+- whitespace removal is enabled by default, with --no-whitespace-removal to opt out
+- --show-output-files [sort] to print included-file size stats with bars
+- --watch to automatically rebuild on file changes
+- --no-default-ignores to disable built-in ignore sets
+- optional multi-input mode via -i/--input
 """
 
 from __future__ import annotations
 
 import argparse
-import re
+import fnmatch
 import sys
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 SKIP_DIRS = frozenset({
     ".git",
@@ -86,6 +86,7 @@ SKIP_SUFFIXES = frozenset({
 })
 
 DOC_ONLY_EXTENSIONS = frozenset({".md", ".txt"})
+WHITESPACE_SENSITIVE_EXTENSIONS = frozenset({".py", ".yaml", ".yml"})
 
 LANGUAGE_MAP = {
     ".ts": "ts",
@@ -126,7 +127,6 @@ LANGUAGE_MAP = {
     ".proto": "proto",
 }
 
-PRINTABLE_TEXT_RE = re.compile(rb"[\x09\x0A\x0D\x20-\x7E]")
 BINARY_CHECK_CHUNK_SIZE = 8192
 MAX_TREE_LINES = 400
 MAX_SUMMARY_BULLETS = 8
@@ -153,15 +153,125 @@ class FileRecord:
     content: Optional[str] = None
     chunks: List[Chunk] = field(default_factory=list)
     summary_points: List[str] = field(default_factory=list)
-    skip_reason: Optional[str] = None
+    minify_reason: Optional[str] = None
+    original_char_count: Optional[int] = None
+
+
+@dataclass
+class BuildStats:
+    total_files: int = 0
+    included_count: int = 0
+    default_ignored_count: int = 0
+    custom_ignored_count: int = 0
+    minified_count: int = 0
+    binary_skipped_count: int = 0
+    skipped_count: int = 0
+    total_input_chars: int = 0
+    total_output_chars: int = 0
+
+
+@dataclass
+class RootConfig:
+    root: Path
+    display_name: str
+    ignore_patterns: List[str]
+    minify_patterns: List[str]
+
+
+@dataclass
+class CollectResult:
+    files: List[Tuple[Path, RootConfig, str]]
+    skipped: List[Tuple[str, str]]
+    default_ignored_count: int
+    custom_ignored_count: int
+    binary_skipped_count: int
+
+
+def eprint(*args: object) -> None:
+    print(*args, file=sys.stderr)
 
 
 def get_language(path: Path) -> str:
     return LANGUAGE_MAP.get(path.suffix.lower(), path.suffix.lower().lstrip(".") or "text")
 
 
-def should_skip_dir(name: str, include_hidden: bool) -> bool:
-    if name in SKIP_DIRS:
+def normalize_extensions(raw: Optional[str]) -> Optional[frozenset[str]]:
+    if not raw:
+        return None
+    values: List[str] = []
+    for item in raw.split(","):
+        item = item.strip().lower()
+        if not item:
+            continue
+        values.append(item if item.startswith(".") else f".{item}")
+    return frozenset(values) if values else None
+
+
+def has_valid_extension(path: Path, extensions: Optional[frozenset[str]]) -> bool:
+    return extensions is None or path.suffix.lower() in extensions
+
+
+def load_pattern_file(root: Path, filename: str) -> List[str]:
+    path = root / filename
+    if not path.exists() or not path.is_file():
+        return []
+    patterns: List[str] = []
+    try:
+        for raw in path.read_text(encoding="utf-8", errors="replace").splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            patterns.append(line)
+    except OSError as exc:
+        eprint(f"Warning: cannot read pattern file {path}: {exc}")
+    return patterns
+
+
+def match_pattern(rel_path: str, name: str, is_dir: bool, pattern: str) -> bool:
+    rel_path = rel_path.replace("\\", "/")
+    pattern = pattern.strip().replace("\\", "/")
+    if not pattern:
+        return False
+
+    anchored = pattern.startswith("/")
+    if anchored:
+        pattern = pattern[1:]
+
+    dir_only = pattern.endswith("/")
+    if dir_only:
+        pattern = pattern.rstrip("/")
+
+    candidates = [rel_path]
+    if not anchored:
+        candidates.append(name)
+
+    for candidate in candidates:
+        if fnmatch.fnmatchcase(candidate, pattern):
+            if not dir_only or is_dir:
+                return True
+        if dir_only and (candidate == pattern or candidate.startswith(pattern + "/")):
+            return True
+
+    if not anchored and "/" not in pattern:
+        path_parts = rel_path.split("/")
+        for idx in range(len(path_parts)):
+            sub = "/".join(path_parts[idx:])
+            if fnmatch.fnmatchcase(sub, pattern):
+                if not dir_only or is_dir:
+                    return True
+            if dir_only and (sub == pattern or sub.startswith(pattern + "/")):
+                return True
+
+    return False
+
+
+def matches_any_pattern(rel_path: str, is_dir: bool, patterns: Sequence[str]) -> bool:
+    name = Path(rel_path).name
+    return any(match_pattern(rel_path, name, is_dir, pattern) for pattern in patterns)
+
+
+def should_skip_dir(name: str, include_hidden: bool, use_default_ignores: bool) -> bool:
+    if use_default_ignores and name in SKIP_DIRS:
         return True
     if not include_hidden and name.startswith("."):
         return True
@@ -169,15 +279,6 @@ def should_skip_dir(name: str, include_hidden: bool) -> bool:
 
 
 def is_binary(file_path: Path) -> bool:
-    """
-    Heuristic binary detector.
-
-    Rules:
-    - known text extensions are never treated as binary
-    - files containing NUL bytes are binary
-    - otherwise inspect a sample and classify as binary only if the
-      non-text byte ratio is meaningfully high
-    """
     text_suffixes = {
         ".md", ".mdx", ".txt", ".rst",
         ".py", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs",
@@ -200,68 +301,58 @@ def is_binary(file_path: Path) -> bool:
 
     if not chunk:
         return False
-
     if b"\x00" in chunk:
         return True
 
     text_byte_set = set(range(32, 127)) | {9, 10, 13, 8, 12}
     nontext = sum(byte not in text_byte_set for byte in chunk)
-    ratio = nontext / len(chunk)
-
-    return ratio > 0.30
-
-
-def normalize_extensions(raw: Optional[str]) -> Optional[frozenset[str]]:
-    if not raw:
-        return None
-
-    values = []
-    for item in raw.split(","):
-        item = item.strip().lower()
-        if not item:
-            continue
-        values.append(item if item.startswith(".") else f".{item}")
-    return frozenset(values) if values else None
-
-
-def has_valid_extension(path: Path, extensions: Optional[frozenset[str]]) -> bool:
-    return extensions is None or path.suffix.lower() in extensions
+    return (nontext / len(chunk)) > 0.30
 
 
 def should_skip_file(
     path: Path,
+    rel_path: str,
     include_hidden: bool,
     extensions: Optional[frozenset[str]],
-) -> Optional[str]:
+    use_default_ignores: bool,
+    custom_ignore_patterns: Sequence[str],
+) -> Optional[Tuple[str, str]]:
     name = path.name
     suffix = path.suffix.lower()
 
     if not include_hidden and name.startswith("."):
-        return "hidden"
-    if name in SKIP_EXACT_FILES:
-        return "lockfile/local env"
-    if suffix in SKIP_SUFFIXES:
-        return "binary or low-signal asset"
+        return ("default", "hidden")
+    if use_default_ignores and name in SKIP_EXACT_FILES:
+        return ("default", "lockfile/local env")
+    if use_default_ignores and suffix in SKIP_SUFFIXES:
+        return ("default", "binary or low-signal asset")
+    if custom_ignore_patterns and matches_any_pattern(rel_path, False, custom_ignore_patterns):
+        return ("custom", "matched ignore pattern")
     if not has_valid_extension(path, extensions):
-        return "extension filtered out"
+        return ("default", "extension filtered out")
     if is_binary(path):
-        return "binary"
+        return ("default", "binary")
     return None
 
 
 def collect_files(
-    root_dir: Path,
+    roots: Sequence[RootConfig],
     include_hidden: bool,
     extensions: Optional[frozenset[str]],
-) -> Tuple[List[Path], List[Tuple[str, str]]]:
-    included: List[Path] = []
+    use_default_ignores: bool,
+) -> CollectResult:
+    included: List[Tuple[Path, RootConfig, str]] = []
     skipped: List[Tuple[str, str]] = []
+    default_ignored_count = 0
+    custom_ignored_count = 0
+    binary_skipped_count = 0
 
-    def walk(current: Path) -> None:
+    def walk(root_cfg: RootConfig, current: Path) -> None:
+        nonlocal default_ignored_count, custom_ignored_count, binary_skipped_count
         try:
             entries = sorted(current.iterdir(), key=lambda p: p.name.lower())
         except OSError as exc:
-            print(f"Warning: cannot read directory {current}: {exc}", file=sys.stderr)
+            eprint(f"Warning: cannot read directory {current}: {exc}")
             return
 
         for entry in entries:
@@ -270,33 +361,86 @@ def collect_files(
             except OSError:
                 continue
 
-            rel = str(entry.relative_to(root_dir)).replace("\\", "/")
+            rel = str(entry.relative_to(root_cfg.root)).replace("\\", "/")
+            display_rel = rel if len(roots) == 1 else f"{root_cfg.display_name}/{rel}"
+
             if is_dir:
-                if should_skip_dir(entry.name, include_hidden):
-                    skipped.append((rel + "/", "skipped directory"))
+                if should_skip_dir(entry.name, include_hidden, use_default_ignores):
+                    skipped.append((display_rel + "/", "skipped directory"))
+                    default_ignored_count += 1
                     continue
-                walk(entry)
+                if root_cfg.ignore_patterns and matches_any_pattern(rel, True, root_cfg.ignore_patterns):
+                    skipped.append((display_rel + "/", "matched ignore pattern"))
+                    custom_ignored_count += 1
+                    continue
+                walk(root_cfg, entry)
                 continue
 
-            reason = should_skip_file(entry, include_hidden, extensions)
-            if reason:
-                skipped.append((rel, reason))
+            result = should_skip_file(
+                entry,
+                rel,
+                include_hidden,
+                extensions,
+                use_default_ignores,
+                root_cfg.ignore_patterns,
+            )
+            if result:
+                group, reason = result
+                skipped.append((display_rel, reason))
+                if group == "custom":
+                    custom_ignored_count += 1
+                else:
+                    default_ignored_count += 1
+                    if reason == "binary":
+                        binary_skipped_count += 1
                 continue
 
-            included.append(entry)
+            included.append((entry, root_cfg, display_rel))
 
-    walk(root_dir)
-    included.sort(key=lambda p: str(p).replace("\\", "/"))
+    for root_cfg in roots:
+        walk(root_cfg, root_cfg.root)
+
+    included.sort(key=lambda item: item[2])
     skipped.sort(key=lambda x: x[0])
-    return included, skipped
+    return CollectResult(
+        files=included,
+        skipped=skipped,
+        default_ignored_count=default_ignored_count,
+        custom_ignored_count=custom_ignored_count,
+        binary_skipped_count=binary_skipped_count,
+    )
 
 
 def read_file_content(path: Path) -> Optional[str]:
     try:
         return path.read_text(encoding="utf-8", errors="replace")
     except OSError as exc:
-        print(f"Warning: cannot read file {path}: {exc}", file=sys.stderr)
+        eprint(f"Warning: cannot read file {path}: {exc}")
         return None
+
+
+def remove_excess_whitespace(content: str, path: Path) -> str:
+    if path.suffix.lower() in WHITESPACE_SENSITIVE_EXTENSIONS:
+        return content
+
+    lines = content.splitlines()
+    cleaned: List[str] = []
+    blank_run = 0
+    for line in lines:
+        stripped = line.rstrip()
+        if stripped == "":
+            blank_run += 1
+            if blank_run > 1:
+                continue
+            cleaned.append("")
+        else:
+            blank_run = 0
+            cleaned.append(stripped)
+
+    result = "\n".join(cleaned).strip("\n")
+    if content.endswith("\n") and result:
+        result += "\n"
+    return result
 
 
 def summarize_role(path: Path) -> str:
@@ -382,6 +526,8 @@ def first_nonempty_lines(content: str, limit: int = 12) -> List[str]:
 
 
 def extract_summary_points(path: Path, content: str, role: str) -> List[str]:
+    import re
+
     suffix = path.suffix.lower()
     points: List[str] = []
 
@@ -444,6 +590,8 @@ def offset_to_line(offsets: Sequence[int], char_offset: int) -> int:
 
 
 def chunk_markdown(content: str) -> List[Chunk]:
+    import re
+
     lines = content.splitlines()
     chunks: List[Chunk] = []
     current_title = "Document start"
@@ -470,6 +618,8 @@ def chunk_markdown(content: str) -> List[Chunk]:
 
 
 def chunk_code(content: str) -> List[Chunk]:
+    import re
+
     patterns = [
         r"^(?:export\s+)?(?:async\s+)?function\s+([A-Za-z_][A-Za-z0-9_]*)",
         r"^(?:export\s+)?class\s+([A-Za-z_][A-Za-z0-9_]*)",
@@ -515,11 +665,14 @@ def choose_mode(
     priority: int,
     full_cutoff: int,
     chunk_cutoff: int,
+    is_minified: bool,
 ) -> str:
     char_count = len(content)
     line_count = len(content.splitlines())
     rp = str(path).replace("\\", "/").lower()
 
+    if is_minified:
+        return "minified"
     if "/generated/" in rp or "/gen/" in rp or rp.endswith(".min.js"):
         return "summary"
     if priority >= 100:
@@ -561,7 +714,6 @@ def build_directory_tree(records: Sequence[FileRecord]) -> List[str]:
     def walk(prefix: str, depth: int) -> None:
         if len(lines) >= MAX_TREE_LINES:
             return
-
         names = sorted(children.get(prefix, set()), key=str.lower)
         for name in names:
             path = f"{prefix}/{name}" if prefix else name
@@ -573,10 +725,8 @@ def build_directory_tree(records: Sequence[FileRecord]) -> List[str]:
                     return
 
     walk("", 0)
-
     if len(lines) >= MAX_TREE_LINES:
         lines.append("- ... tree truncated ...")
-
     return lines
 
 
@@ -590,6 +740,16 @@ def cap_chunk_content(text: str, max_chars: int) -> str:
     return text[:max_chars].rstrip() + "\n... [chunk truncated]"
 
 
+def format_minified_placeholder(record: FileRecord) -> str:
+    suffix = Path(record.relative_path).suffix.lower().lstrip(".") or record.language
+    reason = record.minify_reason or ".aidigestminify"
+    return (
+        f"# {record.relative_path}\n\n"
+        f"This is a minified file of type: {suffix.upper()}\n"
+        f"(File exists but content excluded via {reason})\n"
+    )
+
+
 def record_to_section(record: FileRecord, chunk_char_limit: int) -> List[str]:
     lines = [
         f"## FILE: {record.relative_path}",
@@ -600,6 +760,12 @@ def record_to_section(record: FileRecord, chunk_char_limit: int) -> List[str]:
         f"- Characters: {record.char_count}",
         "",
     ]
+
+    if record.mode == "minified":
+        lines.append("### Minified Placeholder")
+        lines.extend(format_code_fence(format_minified_placeholder(record), "markdown"))
+        lines.append("")
+        return lines
 
     if record.mode == "summary":
         lines.append("### Summary")
@@ -628,16 +794,20 @@ def record_to_section(record: FileRecord, chunk_char_limit: int) -> List[str]:
     return lines
 
 
+def estimate_tokens_from_chars(char_count: int) -> int:
+    return max(1, round(char_count / 4)) if char_count else 0
+
+
 def build_markdown(
     root_name: str,
     records: Sequence[FileRecord],
     skipped: Sequence[Tuple[str, str]],
     max_output_chars: int,
     chunk_char_limit: int,
+    stats: BuildStats,
 ) -> str:
     total_lines = sum(record.line_count for record in records)
-    mode_counts: Dict[str, int] = {"full": 0, "chunked": 0, "summary": 0}
-
+    mode_counts: Dict[str, int] = {"full": 0, "chunked": 0, "summary": 0, "minified": 0}
     for record in records:
         mode_counts[record.mode] = mode_counts.get(record.mode, 0) + 1
 
@@ -650,10 +820,15 @@ def build_markdown(
         "## MANIFEST",
         f"- Included files: {len(records)}",
         f"- Skipped files/directories: {len(skipped)}",
+        f"- Default ignored count: {stats.default_ignored_count}",
+        f"- Custom ignored count: {stats.custom_ignored_count}",
+        f"- Minified count: {stats.minified_count}",
         f"- Total included lines: {total_lines}",
         f"- Full files: {mode_counts.get('full', 0)}",
         f"- Chunked files: {mode_counts.get('chunked', 0)}",
         f"- Summary files: {mode_counts.get('summary', 0)}",
+        f"- Minified placeholder files: {mode_counts.get('minified', 0)}",
+        f"- Estimated tokens: {estimate_tokens_from_chars(stats.total_output_chars)}",
         "",
         "## READING GUIDE",
         "Start with these files first:",
@@ -705,16 +880,12 @@ def build_markdown(
                     line_count=record.line_count,
                     char_count=record.char_count,
                     priority=record.priority,
-                    summary_points=record.summary_points or extract_summary_points(
-                        Path(record.relative_path),
-                        record.content or "",
-                        record.role,
-                    ),
+                    summary_points=record.summary_points,
                 )
                 section_lines = record_to_section(fallback, chunk_char_limit)
                 section_text = "\n".join(section_lines)
             elif record.mode == "chunked":
-                slim = FileRecord(
+                fallback = FileRecord(
                     relative_path=record.relative_path,
                     language=record.language,
                     role=record.role,
@@ -724,7 +895,7 @@ def build_markdown(
                     priority=record.priority,
                     summary_points=record.summary_points,
                 )
-                section_lines = record_to_section(slim, chunk_char_limit)
+                section_lines = record_to_section(fallback, chunk_char_limit)
                 section_text = "\n".join(section_lines)
 
         if current_chars + len(section_text) + 2 > max_output_chars:
@@ -755,23 +926,27 @@ def build_markdown(
 
 
 def build_records(
-    root: Path,
-    files: Sequence[Path],
+    collected: Sequence[Tuple[Path, RootConfig, str]],
     full_cutoff: int,
     chunk_cutoff: int,
-) -> List[FileRecord]:
+    whitespace_removal: bool,
+) -> Tuple[List[FileRecord], BuildStats]:
     records: List[FileRecord] = []
+    stats = BuildStats(total_files=len(collected), included_count=0)
 
-    for file_path in files:
-        content = read_file_content(file_path)
-        if content is None:
+    for file_path, root_cfg, display_rel in collected:
+        raw_content = read_file_content(file_path)
+        if raw_content is None:
             continue
 
-        relative = str(file_path.relative_to(root)).replace("\\", "/")
+        rel_for_matching = str(file_path.relative_to(root_cfg.root)).replace("\\", "/")
+        is_minified = bool(root_cfg.minify_patterns and matches_any_pattern(rel_for_matching, False, root_cfg.minify_patterns))
+        content = remove_excess_whitespace(raw_content, file_path) if whitespace_removal else raw_content
+
         language = get_language(file_path)
         role = summarize_role(file_path)
         priority = priority_score(file_path, role)
-        mode = choose_mode(file_path, role, content, priority, full_cutoff, chunk_cutoff)
+        mode = choose_mode(file_path, role, content, priority, full_cutoff, chunk_cutoff, is_minified)
         summary_points = extract_summary_points(file_path, content, role)
         line_count = len(content.splitlines())
         char_count = len(content)
@@ -785,7 +960,7 @@ def build_records(
 
         records.append(
             FileRecord(
-                relative_path=relative,
+                relative_path=display_rel,
                 language=language,
                 role=role,
                 mode=mode,
@@ -795,17 +970,60 @@ def build_records(
                 content=content if mode == "full" else None,
                 chunks=chunks,
                 summary_points=summary_points,
+                minify_reason=".aidigestminify" if is_minified else None,
+                original_char_count=len(raw_content),
             )
         )
 
+        stats.included_count += 1
+        stats.total_input_chars += len(raw_content)
+        stats.total_output_chars += char_count
+        if is_minified:
+            stats.minified_count += 1
+
     records.sort(key=lambda record: (-record.priority, record.relative_path))
-    return records
+    return records, stats
 
 
-def build_default_output_name(root: Path, docs_only: bool) -> str:
-    folder = root.name.upper()
+def print_output_file_stats(records: Sequence[FileRecord], mode: Optional[str]) -> None:
+    if mode is None:
+        return
+
+    sortable = list(records)
+    if mode == "sort":
+        sortable.sort(key=lambda record: record.char_count, reverse=True)
+    else:
+        sortable.sort(key=lambda record: record.relative_path.lower())
+
+    max_chars = max((record.char_count for record in sortable), default=1)
+    print("\nIncluded files:")
+    for record in sortable:
+        bar_len = 1 if max_chars <= 0 else max(1, int((record.char_count / max_chars) * 24))
+        bar = "█" * bar_len
+        print(f"{record.char_count:>8} chars  {bar:<24}  {record.relative_path} [{record.mode}]")
+    total_chars = sum(record.char_count for record in sortable)
+    print(f"Total output chars: {total_chars}")
+    print(f"Estimated tokens:  {estimate_tokens_from_chars(total_chars)}")
+
+
+def build_default_output_name(roots: Sequence[Path], docs_only: bool) -> str:
+    if len(roots) == 1:
+        folder = roots[0].name.upper()
+    else:
+        folder = "MULTI"
     suffix = "DOCS" if docs_only else "CODEBASE"
     return f"STACKMD-{folder}-{suffix}.md"
+
+
+def resolve_output_path(output_arg: Optional[str], roots: Sequence[Path], docs_only: bool) -> Path:
+    if output_arg:
+        output_path = Path(output_arg).expanduser()
+        return output_path if output_path.is_absolute() else Path.cwd() / output_path
+
+    default_name = build_default_output_name(roots, docs_only)
+    if len(roots) == 1:
+        return roots[0] / default_name
+    return Path.cwd() / default_name
 
 
 def parse_args() -> argparse.Namespace:
@@ -819,10 +1037,16 @@ def parse_args() -> argparse.Namespace:
         help="Directory to scan (default: current directory)",
     )
     parser.add_argument(
+        "-i",
+        "--input",
+        nargs="+",
+        help="One or more input directories. If provided, overrides the positional directory.",
+    )
+    parser.add_argument(
         "-o",
         "--output",
         default=None,
-        help="Output path (default: STACKMD-<FOLDER>-CODEBASE.md or STACKMD-<FOLDER>-DOCS.md inside the scanned repo)",
+        help="Output path (default: STACKMD-<FOLDER>-CODEBASE.md or STACKMD-<FOLDER>-DOCS.md)",
     )
     parser.add_argument(
         "--include-hidden",
@@ -863,42 +1087,128 @@ def parse_args() -> argparse.Namespace:
         default=18_000,
         help="Max chars per emitted chunk in chunked mode",
     )
+    parser.add_argument(
+        "--ignore-file",
+        default=".aidigestignore",
+        help="Custom ignore file name (default: .aidigestignore)",
+    )
+    parser.add_argument(
+        "--minify-file",
+        default=".aidigestminify",
+        help="Custom minify file name (default: .aidigestminify)",
+    )
+    parser.add_argument(
+        "--no-default-ignores",
+        action="store_true",
+        help="Disable default ignore patterns",
+    )
+    parser.add_argument(
+        "--show-output-files",
+        nargs="?",
+        const="name",
+        choices=("name", "sort"),
+        help="Display included files with size bars; use 'sort' for largest first",
+    )
+    parser.add_argument(
+        "--watch",
+        action="store_true",
+        help="Watch for changes and rebuild automatically",
+    )
+    parser.add_argument(
+        "--watch-interval",
+        type=float,
+        default=1.0,
+        help="Polling interval in seconds for watch mode (default: 1.0)",
+    )
+    parser.add_argument(
+        "--whitespace-removal",
+        dest="whitespace_removal",
+        action="store_true",
+        help="Enable whitespace removal (default behavior)",
+    )
+    parser.add_argument(
+        "--no-whitespace-removal",
+        dest="whitespace_removal",
+        action="store_false",
+        help="Disable whitespace removal",
+    )
+    parser.set_defaults(whitespace_removal=True)
     return parser.parse_args()
 
 
-def main() -> int:
-    args = parse_args()
-    root = Path(args.directory).expanduser().resolve()
+def resolve_roots(args: argparse.Namespace) -> List[Path]:
+    raw_inputs = args.input if args.input else [args.directory]
+    roots: List[Path] = []
+    for raw in raw_inputs:
+        path = Path(raw).expanduser().resolve()
+        if not path.exists():
+            raise FileNotFoundError(f"directory does not exist: {path}")
+        if not path.is_dir():
+            raise NotADirectoryError(f"path is not a directory: {path}")
+        roots.append(path)
+    return roots
 
-    if not root.exists():
-        print(f"Error: directory does not exist: {root}", file=sys.stderr)
-        return 1
-    if not root.is_dir():
-        print(f"Error: path is not a directory: {root}", file=sys.stderr)
-        return 1
 
-    if args.docs_only:
-        extensions = DOC_ONLY_EXTENSIONS
-    else:
-        extensions = normalize_extensions(args.extensions)
+def make_root_configs(roots: Sequence[Path], ignore_file: str, minify_file: str) -> List[RootConfig]:
+    configs: List[RootConfig] = []
+    multi = len(roots) > 1
+    for root in roots:
+        configs.append(
+            RootConfig(
+                root=root,
+                display_name=root.name if multi else "",
+                ignore_patterns=load_pattern_file(root, ignore_file),
+                minify_patterns=load_pattern_file(root, minify_file),
+            )
+        )
+    return configs
 
-    files, skipped = collect_files(root, args.include_hidden, extensions)
-    records = build_records(root, files, args.full_cutoff, args.chunk_cutoff)
 
+def compute_watch_snapshot(roots: Sequence[Path], output_path: Path) -> Dict[str, Tuple[int, int]]:
+    snapshot: Dict[str, Tuple[int, int]] = {}
+    for root in roots:
+        for path in root.rglob("*"):
+            if output_path.exists() and path.resolve() == output_path.resolve():
+                continue
+            try:
+                stat = path.stat()
+            except OSError:
+                continue
+            snapshot[str(path)] = (int(stat.st_mtime_ns), int(stat.st_size))
+    return snapshot
+
+
+def run_build(args: argparse.Namespace) -> Path:
+    roots = resolve_roots(args)
+    extensions = DOC_ONLY_EXTENSIONS if args.docs_only else normalize_extensions(args.extensions)
+    root_cfgs = make_root_configs(roots, args.ignore_file, args.minify_file)
+    collected = collect_files(
+        roots=root_cfgs,
+        include_hidden=args.include_hidden,
+        extensions=extensions,
+        use_default_ignores=not args.no_default_ignores,
+    )
+    records, stats = build_records(
+        collected=collected.files,
+        full_cutoff=args.full_cutoff,
+        chunk_cutoff=args.chunk_cutoff,
+        whitespace_removal=args.whitespace_removal,
+    )
+    stats.default_ignored_count = collected.default_ignored_count
+    stats.custom_ignored_count = collected.custom_ignored_count
+    stats.binary_skipped_count = collected.binary_skipped_count
+    stats.skipped_count = len(collected.skipped)
+
+    output_path = resolve_output_path(args.output, roots, args.docs_only)
+    root_name = roots[0].name if len(roots) == 1 else "MULTI"
     markdown = build_markdown(
-        root_name=root.name,
+        root_name=root_name,
         records=records,
-        skipped=skipped,
+        skipped=collected.skipped,
         max_output_chars=args.max_output_chars,
         chunk_char_limit=args.chunk_char_limit,
+        stats=stats,
     )
-
-    if args.output:
-        output_path = Path(args.output).expanduser()
-        if not output_path.is_absolute():
-            output_path = Path.cwd() / output_path
-    else:
-        output_path = root / build_default_output_name(root, args.docs_only)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(markdown, encoding="utf-8")
@@ -906,10 +1216,50 @@ def main() -> int:
     total_lines = sum(record.line_count for record in records)
     print(
         f"Created {output_path} with {len(records)} included files, "
-        f"{len(skipped)} skipped items, and {total_lines} included lines"
+        f"{len(collected.skipped)} skipped items, {stats.minified_count} minified files, "
+        f"and {total_lines} included lines"
     )
-    return 0
+    if args.show_output_files:
+        print_output_file_stats(records, args.show_output_files)
+    return output_path
+
+
+def watch_and_rebuild(args: argparse.Namespace) -> int:
+    roots = resolve_roots(args)
+    output_path = resolve_output_path(args.output, roots, args.docs_only)
+    last_snapshot: Optional[Dict[str, Tuple[int, int]]] = None
+
+    try:
+        while True:
+            try:
+                current_snapshot = compute_watch_snapshot(roots, output_path)
+                if last_snapshot is None or current_snapshot != last_snapshot:
+                    run_build(args)
+                    last_snapshot = current_snapshot
+                time.sleep(max(0.2, args.watch_interval))
+            except KeyboardInterrupt:
+                print("\nWatch mode stopped.")
+                return 0
+    except KeyboardInterrupt:
+        print("\nWatch mode stopped.")
+        return 0
+
+
+def main() -> int:
+    args = parse_args()
+    try:
+        if args.watch:
+            return watch_and_rebuild(args)
+        run_build(args)
+        return 0
+    except FileNotFoundError as exc:
+        eprint(f"Error: {exc}")
+        return 1
+    except NotADirectoryError as exc:
+        eprint(f"Error: {exc}")
+        return 1
 
 
 if __name__ == "__main__":
     sys.exit(main())
+
